@@ -1,15 +1,19 @@
 # Handoff — CAISO Battery Storage Trading Desk
 
-**Date:** 2026-05-17  
-**Repo:** https://github.com/juan-sandoval0/caiso-battery-trading-desk  
-**Phase complete:** Phase 1 (Data Pipeline)  
-**Phase next:** Phase 2 (Price Forecaster + Dispatch Optimizer)
+**Date:** 2026-05-30 (revised; original 2026-05-17)
+**Repo:** https://github.com/juan-sandoval0/caiso-battery-trading-desk
+**Code state:** Phases 1–3 implemented (committed on branch `finish-project`)
+**Remaining:** run against real data (fetch/train/backtest), fill 48 stubbed tests, dashboard, notebooks, report
+
+> **Note:** The original 2026-05-17 handoff described everything past Phase 1 as
+> `NotImplementedError` stubs. That was stale — the implementation had been written
+> but left uncommitted. It is now committed (commit "Implement Phase 2-3 agents…").
 
 ---
 
 ## What exists right now
 
-### Fully implemented and tested
+### Fully implemented (config + data layer, Phase 1)
 | File | What it does |
 |------|-------------|
 | `src/config/settings.py` | Pydantic settings loaded from `.env`; `get_settings()` is a cached singleton |
@@ -18,10 +22,21 @@
 | `src/data/db.py` | DuckDB wrapper with 8-table schema; `INSERT OR REPLACE` upserts; `query_lmp()`, `query_features()`, `get_latest_data_date()` |
 | `src/data/caiso_fetcher.py` | Fetches LMP (DA + RT 5-min), load, fuel mix, storage SOC, curtailment via gridstatus; 30-day chunks, 3-retry backoff |
 | `src/data/weather_fetcher.py` | Open-Meteo ERA5 historical + 7-day forecast; hourly solar irradiance, temperature, wind |
-| `main.py` | `data-fetch` CLI with `--incremental`, `--skip-storage`, `--skip-weather` flags |
+| `main.py` | All four CLI commands wired: `data-fetch`, `train`, `backtest`, `paper-trade` |
 
-### Stub files (signatures + docstrings, no implementation)
-All files in `src/agents/`, `src/orchestrator/`, `src/models/`, `src/optimization/`, `src/dashboard/`, and all `tests/` files exist with full type-hinted signatures and implementation comments. Nothing raises silently — everything is `raise NotImplementedError(...)`.
+### Implemented but not yet exercised against real data (Phases 2–3)
+| Area | Files | Status |
+|------|-------|--------|
+| Forecasting | `src/models/features.py`, `src/models/price_model.py` | Full impl; never trained on real data |
+| Optimization | `src/optimization/battery_dispatch.py` | Pyomo LP + naive/perfect baselines |
+| Agents | `src/agents/{forecaster,optimizer,risk_monitor,market_intel}.py` | Full impl |
+| Orchestrator | `src/orchestrator/{shared_state,conflict_resolver,coordinator}.py` | Full impl; 28 unit tests passing |
+
+### Still outstanding
+- **Data:** DuckDB is empty (interrupted fetch left only a WAL). Needs a real fetch.
+- **Tests:** 48 of 80 are still `NotImplementedError` stubs (agents, data, models, optimization).
+- **Dashboard:** `src/dashboard/app.py` is a stub.
+- **Notebooks/report:** `notebooks/`, `report/` not created.
 
 ---
 
