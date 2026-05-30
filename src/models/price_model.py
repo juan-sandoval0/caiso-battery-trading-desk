@@ -46,6 +46,11 @@ class PriceModel:
         """
         self.model_type = model_type
         self._model = None
+        # DA prices are heavily right-skewed (scarcity spikes) with occasional
+        # negatives; fitting in log space sharply reduces spike leverage on RMSE.
+        # The offset keeps log1p(price + offset) positive (CAISO floor ≈ -$150).
+        self._use_log = model_type == "da"
+        self._log_offset: float = 150.0
 
         if model_type == "da":
             import xgboost as xgb
@@ -86,36 +91,55 @@ class PriceModel:
         Returns:
             Dict with 'train_rmse' and optionally 'val_rmse'.
         """
+        # Choose an offset that keeps log1p(price + offset) defined for the
+        # training data, with a floor that covers CAISO's ~-$150 price floor.
+        if self._use_log:
+            self._log_offset = max(150.0, float(-np.min(y_train)) + 10.0)
+
+        y_train_fit = self._fwd(y_train)
+        y_val_fit = self._fwd(y_val) if y_val is not None else None
+
         if self.model_type == "da":
             if X_val is not None:
                 self._model.set_params(early_stopping_rounds=50)
                 self._model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_val, y_val)],
+                    X_train, y_train_fit,
+                    eval_set=[(X_val, y_val_fit)],
                     verbose=False,
                 )
             else:
-                self._model.fit(X_train, y_train)
+                self._model.fit(X_train, y_train_fit)
         else:
             import lightgbm as lgb
             fit_kwargs: dict = {}
             if X_val is not None:
-                fit_kwargs["eval_set"] = [(X_val, y_val)]
+                fit_kwargs["eval_set"] = [(X_val, y_val_fit)]
                 fit_kwargs["callbacks"] = [
                     lgb.early_stopping(stopping_rounds=50, verbose=False),
                     lgb.log_evaluation(period=-1),
                 ]
-            self._model.fit(X_train, y_train, **fit_kwargs)
+            self._model.fit(X_train, y_train_fit, **fit_kwargs)
 
-        train_preds = self._model.predict(X_train)
+        # Metrics are reported in real price space (after inverse transform).
         metrics: dict[str, float] = {
-            "train_rmse": float(np.sqrt(mean_squared_error(y_train, train_preds)))
+            "train_rmse": float(np.sqrt(mean_squared_error(y_train, self.predict(X_train))))
         }
         if X_val is not None and y_val is not None:
-            val_preds = self._model.predict(X_val)
-            metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, val_preds)))
+            metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, self.predict(X_val))))
 
         return metrics
+
+    def _fwd(self, y: pd.Series | None) -> pd.Series | None:
+        """Forward target transform (identity unless log-space is enabled)."""
+        if y is None or not self._use_log:
+            return y
+        return np.log1p(y + self._log_offset)
+
+    def _inv(self, y: np.ndarray) -> np.ndarray:
+        """Inverse target transform back to $/MWh."""
+        if not self._use_log:
+            return y
+        return np.expm1(y) - self._log_offset
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Generate LMP forecasts for the given feature matrix.
@@ -137,7 +161,7 @@ class PriceModel:
                 X[col] = 0.0
             X = X[expected]
 
-        return self._model.predict(X)
+        return self._inv(self._model.predict(X))
 
     def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
         """Compute evaluation metrics on held-out test data.
@@ -166,7 +190,15 @@ class PriceModel:
             raise RuntimeError("Cannot save: model has not been trained yet.")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"model": self._model, "model_type": self.model_type}, path)
+        joblib.dump(
+            {
+                "model": self._model,
+                "model_type": self.model_type,
+                "use_log": self._use_log,
+                "log_offset": self._log_offset,
+            },
+            path,
+        )
 
     @classmethod
     def load(cls, path: Path | str, model_type: ModelType = "da") -> "PriceModel":
@@ -183,6 +215,8 @@ class PriceModel:
         instance = cls.__new__(cls)
         instance.model_type = payload.get("model_type", model_type)
         instance._model = payload["model"]
+        instance._use_log = payload.get("use_log", False)
+        instance._log_offset = payload.get("log_offset", 150.0)
         return instance
 
     def feature_importance(self, top_n: int = 20) -> pd.DataFrame:

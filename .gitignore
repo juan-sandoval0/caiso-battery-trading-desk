@@ -2,8 +2,8 @@
 .env
 *.env
 
-# Data store (large binary)
-data/
+# Data store (large binary) — anchored so it does not match src/data/
+/data/
 models/artifacts/
 
 # Python
@@ -33,4 +33,3 @@ Thumbs.db
 .ruff_cache/
 .mypy_cache/
 results/
-models/artifacts/
