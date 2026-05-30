@@ -147,7 +147,9 @@ streamlit run src/dashboard/app.py
 
 ## Current Status
 
-- [ ] Phase 1: Data pipeline
-- [ ] Phase 2: Core agents (Forecaster + Optimizer)
-- [ ] Phase 3: Supporting agents + Orchestrator
-- [ ] Phase 4: Dashboard + paper-trading + final report
+- [x] Phase 1: Data pipeline (NP15/SP15/ZP26, 2023-07–2024-12 in DuckDB)
+- [x] Phase 2: Core agents (Forecaster RMSE $15.61 full-H2 OOS; Optimizer LP < 0.02 s)
+- [x] Phase 3: Supporting agents + Orchestrator (LangGraph tick verified end-to-end)
+- [x] Phase 4: Dashboard + benchmarking notebooks + final report
+- Tests: 82 passing (`pytest tests/ -m "not integration"`); 2 live-CAISO integration tests gated on `RUN_INTEGRATION=1`
+- Backtest (2024 H2 OOS): net +$1,054 vs naive −$65,744; Sharpe 1.49; SoC bounds respected on all 176 days
