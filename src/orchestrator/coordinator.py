@@ -166,8 +166,9 @@ class TradingDeskCoordinator:
         optimizer = DispatchOptimizerAgent(battery=DEFAULT_BATTERY, node=settings.default_node)
         risk_monitor = RiskMonitorAgent()
         market_intel = MarketIntelAgent(
-            api_key=settings.anthropic_api_key,
+            api_key=settings.openrouter_api_key,
             caiso_fetcher=caiso_fetcher,
+            base_url=settings.openrouter_base_url,
         )
 
         graph = build_graph(

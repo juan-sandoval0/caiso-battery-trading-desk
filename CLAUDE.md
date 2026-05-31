@@ -16,7 +16,7 @@ A multi-agent AI platform that autonomously operates a simulated battery energy 
          │ reads / writes SharedMarketState (dataclass)
 ┌────────┴──────────────────────────────────────────────────────────┐
 │  PriceForecaster  │  DispatchOptimizer  │  RiskMonitor  │  MktIntel │
-│  XGBoost/LGBM     │  Pyomo + HiGHS      │  rule-based   │  Claude   │
+│  XGBoost/LGBM     │  Pyomo + HiGHS      │  rule-based   │ Claude/OR │
 │  DA + RT LMP      │  SoC-constrained    │  spike/curtail│  notices  │
 └────────┬──────────────────────────────────────────────────────────┘
          │ reads
@@ -90,7 +90,7 @@ CS_153/
 | Package | Version | Purpose |
 |---------|---------|---------|
 | gridstatus | 0.36.0 | CAISO data (LMP, load, storage SOC, curtailment) |
-| anthropic | ≥0.40 | Claude API (market intel agent) |
+| anthropic | ≥0.40 | Claude SDK — market intel agent (routed via OpenRouter, see below) |
 | langchain | ≥0.3 | Agent tool-calling primitives |
 | langgraph | ≥0.2 | Supervisor orchestration graph |
 | pyomo | ≥6.7 | Battery dispatch MILP model |
@@ -103,6 +103,21 @@ CS_153/
 | structlog | ≥24 | Structured logging |
 | pytest | ≥8 | Testing |
 | pytest-asyncio | ≥0.23 | Async test support |
+
+## LLM Provider (MarketIntelAgent)
+
+The `MarketIntelAgent` talks to Claude through **OpenRouter**, not the Anthropic
+API directly. OpenRouter exposes an Anthropic-compatible Messages API, so the
+existing `anthropic` SDK is reused unchanged except for the client `base_url`.
+
+- **Env var**: `OPENROUTER_API_KEY` (`sk-or-v1-...`) in `.env` — required for
+  `paper-trade` and the live orchestrator graph.
+- **Base URL**: `https://openrouter.ai/api` (the SDK appends `/v1/messages`; do
+  **not** include the trailing `/v1`). Override via `OPENROUTER_BASE_URL` if proxying.
+- **Model**: `anthropic/claude-sonnet-4.6` — the OpenRouter slug for the same
+  Anthropic model (`claude-sonnet-4-6`).
+- Config lives in `src/config/settings.py` (`openrouter_api_key`,
+  `openrouter_base_url`); the agent accepts an optional `base_url` arg.
 
 ## CAISO Data Details
 

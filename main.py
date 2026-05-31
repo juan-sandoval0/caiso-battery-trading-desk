@@ -396,8 +396,8 @@ def cmd_paper_trade(args: argparse.Namespace) -> None:
     from src.orchestrator.coordinator import TradingDeskCoordinator
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set in .env — required for MarketIntelAgent.")
+    if not settings.openrouter_api_key:
+        print("ERROR: OPENROUTER_API_KEY not set in .env — required for MarketIntelAgent.")
         sys.exit(1)
 
     node = getattr(args, "node", settings.default_node)

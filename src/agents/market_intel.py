@@ -15,7 +15,8 @@ Data sources (scraped, no auth required):
     - CAISO outage reports: gridstatus get_curtailed_non_operational_generator_report()
     - NWS API: https://api.weather.gov/alerts/active?area=CA (JSON, no key)
 
-Claude model: claude-sonnet-4-6 (fast, sufficient for text summarization)
+Claude model: anthropic/claude-sonnet-4.6 (fast, sufficient for text summarization),
+served via OpenRouter using the Anthropic-compatible Messages API.
 """
 
 from __future__ import annotations
@@ -28,8 +29,13 @@ from typing import Any
 import httpx
 
 
-# Claude model for market intelligence summarization
-_CLAUDE_MODEL: str = "claude-sonnet-4-6"
+# Claude model for market intelligence summarization.
+# OpenRouter slug for the same Anthropic model (claude-sonnet-4-6).
+_CLAUDE_MODEL: str = "anthropic/claude-sonnet-4.6"
+
+# OpenRouter base URL. The anthropic SDK appends "/v1/messages", so this must
+# NOT include the trailing "/v1" (that would double it).
+_OPENROUTER_BASE_URL: str = "https://openrouter.ai/api"
 
 # CAISO market notices page (HTML scrape)
 _CAISO_NOTICES_URL: str = (
@@ -94,20 +100,28 @@ class MarketIntelAgent:
 
     Usage::
 
-        agent = MarketIntelAgent(api_key="sk-ant-...")
+        agent = MarketIntelAgent(api_key="sk-or-v1-...")
         summary = agent.run()
         # Check summary.eea_level, summary.has_curtailment_event, etc.
     """
 
-    def __init__(self, api_key: str, caiso_fetcher: Any | None = None) -> None:
-        """Initialize the agent with Anthropic credentials.
+    def __init__(
+        self,
+        api_key: str,
+        caiso_fetcher: Any | None = None,
+        base_url: str = _OPENROUTER_BASE_URL,
+    ) -> None:
+        """Initialize the agent with OpenRouter credentials.
 
         Args:
-            api_key: Anthropic API key.
+            api_key: OpenRouter API key (sk-or-...). Routed through the
+                Anthropic-compatible Messages API to the same Claude model.
             caiso_fetcher: Optional CAISOFetcher for structured curtailment data.
+            base_url: OpenRouter base URL (the anthropic SDK appends /v1/messages).
         """
         import anthropic
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._base_url = base_url
+        self._client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
         self._caiso_fetcher = caiso_fetcher
         self._http = httpx.Client(timeout=30)
 
@@ -178,7 +192,9 @@ class MarketIntelAgent:
         if not combined.strip():
             return MarketIntelSummary(raw_summary="No market intelligence data available.", sources=sources)
 
-        async_client = _anthropic.AsyncAnthropic(api_key=self._client.api_key)
+        async_client = _anthropic.AsyncAnthropic(
+            api_key=self._client.api_key, base_url=self._base_url
+        )
         try:
             msg = await async_client.messages.create(
                 model=_CLAUDE_MODEL,
