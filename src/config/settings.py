@@ -23,7 +23,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    # MarketIntelAgent routes the same Anthropic model through OpenRouter.
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    openrouter_base_url: str = Field(
+        default="https://openrouter.ai/api", alias="OPENROUTER_BASE_URL"
+    )
     gridstatus_api_key: str = Field(default="", alias="GRIDSTATUS_API_KEY")
     duckdb_path: Path = Field(default=Path("data/market.duckdb"), alias="DUCKDB_PATH")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

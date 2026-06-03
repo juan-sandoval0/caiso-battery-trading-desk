@@ -22,6 +22,7 @@ On detection, the agent either:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -94,10 +95,10 @@ class RiskMonitorAgent:
             negative_price_threshold: LMP below this triggers a negative price event.
             ramp_threshold: Absolute intra-interval LMP change triggering ramp event.
         """
-        raise NotImplementedError(
-            # Store thresholds as self._spike_thr, self._neg_thr, self._ramp_thr.
-            # Initialize self._event_history: list[RiskEvent] = [].
-        )
+        self._spike_thr = price_spike_threshold
+        self._neg_thr = negative_price_threshold
+        self._ramp_thr = ramp_threshold
+        self._event_history: list[RiskEvent] = []
 
     def run(self, state: Any, db: Any) -> list[RiskEvent]:
         """Execute one monitoring tick; return detected risk events.
@@ -112,14 +113,60 @@ class RiskMonitorAgent:
         Returns:
             List of RiskEvent objects detected in this tick (may be empty).
         """
-        raise NotImplementedError(
-            # 1. Detect price spike: check state.latest_rt_lmp against _spike_thr.
-            # 2. Detect negative prices: check against _neg_thr.
-            # 3. Detect ramp events: diff consecutive LMP values in state.recent_lmp.
-            # 4. Check state.market_intel_summary for EEA keywords.
-            # 5. Validate state.dispatch_result SoC trajectory for bound violations.
-            # 6. Aggregate events, update state, log to db, return events list.
-        )
+        events: list[RiskEvent] = []
+
+        lmp = state.latest_rt_lmp
+        if lmp is not None:
+            e = self._detect_price_spike(lmp, interval_idx=0)
+            if e:
+                events.append(e)
+            e = self._detect_negative_prices(lmp, interval_idx=0)
+            if e:
+                events.append(e)
+
+        if state.recent_lmp_df is not None and len(state.recent_lmp_df) > 1:
+            lmp_series = state.recent_lmp_df["lmp"] if "lmp" in state.recent_lmp_df.columns else None
+            if lmp_series is not None:
+                diffs = lmp_series.diff().abs()
+                for i, diff in enumerate(diffs):
+                    if i == 0 or pd.isna(diff):
+                        continue
+                    if diff > self._ramp_thr:
+                        events.append(RiskEvent(
+                            event_type="RAMP_EVENT",
+                            level=RiskLevel.WARNING,
+                            description=f"LMP ramp of ${diff:.1f}/MWh at interval {i}",
+                            recommended_action="ALERT",
+                            raw_value=float(diff),
+                        ))
+                        break  # one ramp event per tick is enough
+
+        intel_text = state.market_intel.raw_summary if state.market_intel else ""
+        e = self._detect_eea(intel_text)
+        if e:
+            events.append(e)
+
+        if state.dispatch_result is not None:
+            from src.config.battery import DEFAULT_BATTERY as bat
+            e = self._validate_soc_trajectory(
+                state.dispatch_result.soc_mwh, bat.soc_min_mwh, bat.soc_max_mwh
+            )
+            if e:
+                events.append(e)
+
+        self._event_history.extend(events)
+        for ev in events:
+            try:
+                db.log_agent_decision(
+                    agent="RiskMonitor",
+                    action=ev.recommended_action,
+                    rationale=ev.description,
+                    metadata={"event_type": ev.event_type, "level": ev.level.value},
+                )
+            except Exception:
+                pass  # never crash the graph tick due to logging failure
+
+        return events
 
     def _detect_price_spike(self, lmp: float, interval_idx: int) -> RiskEvent | None:
         """Return a RiskEvent if lmp exceeds the spike threshold.
@@ -131,10 +178,28 @@ class RiskMonitorAgent:
         Returns:
             RiskEvent with CONSTRAIN action (halt discharge), or None.
         """
-        raise NotImplementedError(
-            # if lmp > self._spike_thr: return RiskEvent(..., recommended_action='CONSTRAIN',
-            #   constraints=[DispatchConstraint(interval_idx, 'discharge', 'eq', 0, 'RiskMonitor')])
-        )
+        if lmp > self._spike_thr:
+            return RiskEvent(
+                event_type="PRICE_SPIKE",
+                level=RiskLevel.CRITICAL,
+                description=(
+                    f"LMP ${lmp:.1f}/MWh exceeds spike threshold "
+                    f"${self._spike_thr:.1f}/MWh — halting discharge"
+                ),
+                recommended_action="CONSTRAIN",
+                constraints=[
+                    DispatchConstraint(
+                        interval_idx=interval_idx,
+                        variable="discharge",
+                        operator="eq",
+                        value_mw=0.0,
+                        source="RiskMonitor",
+                        reason="price_spike_discharge_halt",
+                    )
+                ],
+                raw_value=lmp,
+            )
+        return None
 
     def _detect_negative_prices(self, lmp: float, interval_idx: int) -> RiskEvent | None:
         """Return a RiskEvent if lmp is below the negative threshold.
@@ -148,11 +213,29 @@ class RiskMonitorAgent:
         Returns:
             RiskEvent with CONSTRAIN action (force maximum charge), or None.
         """
-        raise NotImplementedError(
-            # if lmp < self._neg_thr: return RiskEvent(..., recommended_action='CONSTRAIN',
-            #   constraints=[DispatchConstraint(interval_idx, 'charge', 'eq',
-            #     battery.max_charge_mw, 'RiskMonitor')])
-        )
+        if lmp < self._neg_thr:
+            from src.config.battery import DEFAULT_BATTERY as bat
+            return RiskEvent(
+                event_type="NEGATIVE_PRICES",
+                level=RiskLevel.WARNING,
+                description=(
+                    f"LMP ${lmp:.1f}/MWh below threshold "
+                    f"${self._neg_thr:.1f}/MWh — curtailment signal, maximising charge"
+                ),
+                recommended_action="CONSTRAIN",
+                constraints=[
+                    DispatchConstraint(
+                        interval_idx=interval_idx,
+                        variable="charge",
+                        operator="eq",
+                        value_mw=bat.max_charge_mw,
+                        source="RiskMonitor",
+                        reason="negative_prices_max_charge",
+                    )
+                ],
+                raw_value=lmp,
+            )
+        return None
 
     def _detect_eea(self, market_intel_text: str) -> RiskEvent | None:
         """Scan market intelligence text for CAISO Energy Emergency Alert keywords.
@@ -163,10 +246,57 @@ class RiskMonitorAgent:
         Returns:
             RiskEvent with HALT action if EEA detected, or None.
         """
-        raise NotImplementedError(
-            # Check for any string in _EEA_KEYWORDS appearing in market_intel_text.
-            # EEA3 → HALT; EEA1/EEA2 → WARNING + CONSTRAIN (reduce discharge).
-        )
+        if not market_intel_text:
+            return None
+        text_upper = market_intel_text.upper()
+
+        if "EEA3" in text_upper:
+            return RiskEvent(
+                event_type="EEA3",
+                level=RiskLevel.HALT,
+                description="CAISO Energy Emergency Alert Level 3 — halting all dispatch",
+                recommended_action="HALT",
+                raw_value=3.0,
+            )
+        if "EEA2" in text_upper:
+            from src.config.battery import DEFAULT_BATTERY as bat
+            return RiskEvent(
+                event_type="EEA2",
+                level=RiskLevel.CRITICAL,
+                description="CAISO Energy Emergency Alert Level 2 — reducing discharge to 50%",
+                recommended_action="CONSTRAIN",
+                constraints=[
+                    DispatchConstraint(
+                        interval_idx=0,
+                        variable="discharge",
+                        operator="le",
+                        value_mw=bat.max_discharge_mw * 0.5,
+                        source="RiskMonitor",
+                        reason="eea2_reduce_discharge",
+                    )
+                ],
+                raw_value=2.0,
+            )
+        if "EEA1" in text_upper or "ENERGY EMERGENCY ALERT" in text_upper:
+            from src.config.battery import DEFAULT_BATTERY as bat
+            return RiskEvent(
+                event_type="EEA1",
+                level=RiskLevel.CRITICAL,
+                description="CAISO Energy Emergency Alert Level 1 — reducing discharge to 50%",
+                recommended_action="CONSTRAIN",
+                constraints=[
+                    DispatchConstraint(
+                        interval_idx=0,
+                        variable="discharge",
+                        operator="le",
+                        value_mw=bat.max_discharge_mw * 0.5,
+                        source="RiskMonitor",
+                        reason="eea1_reduce_discharge",
+                    )
+                ],
+                raw_value=1.0,
+            )
+        return None
 
     def _validate_soc_trajectory(
         self, soc_mwh: np.ndarray, soc_min: float, soc_max: float
@@ -181,10 +311,21 @@ class RiskMonitorAgent:
         Returns:
             RiskEvent with OVERRIDE action if violation detected, or None.
         """
-        raise NotImplementedError(
-            # Check if any soc_mwh[i] < soc_min or > soc_max.
-            # This should not happen if solver is correct, but acts as a safety net.
-        )
+        tol = 1e-6
+        if np.any(soc_mwh < soc_min - tol) or np.any(soc_mwh > soc_max + tol):
+            v_min = float(np.min(soc_mwh))
+            v_max = float(np.max(soc_mwh))
+            return RiskEvent(
+                event_type="SOC_VIOLATION",
+                level=RiskLevel.CRITICAL,
+                description=(
+                    f"SoC trajectory violates bounds [{soc_min:.2f}, {soc_max:.2f}] MWh. "
+                    f"Actual range: [{v_min:.2f}, {v_max:.2f}] MWh"
+                ),
+                recommended_action="OVERRIDE",
+                raw_value=v_min,
+            )
+        return None
 
     def get_langchain_tools(self) -> list[Any]:
         """Return LangChain Tool definitions for the orchestrator.
@@ -192,4 +333,30 @@ class RiskMonitorAgent:
         Returns:
             List of Tool objects: 'check_risk_status', 'get_risk_event_history'.
         """
-        raise NotImplementedError()
+        from langchain_core.tools import tool
+
+        agent_ref = self
+
+        @tool
+        def check_risk_status(lmp: float) -> str:
+            """Check for risk events given current LMP in $/MWh. Returns JSON."""
+            events = []
+            e = agent_ref._detect_price_spike(lmp, 0)
+            if e:
+                events.append({"type": e.event_type, "level": e.level.value, "action": e.recommended_action})
+            e = agent_ref._detect_negative_prices(lmp, 0)
+            if e:
+                events.append({"type": e.event_type, "level": e.level.value, "action": e.recommended_action})
+            is_halted = any(ev["level"] == "halt" for ev in events)
+            return json.dumps({"risk_events": events, "is_halted": is_halted})
+
+        @tool
+        def get_risk_event_history() -> str:
+            """Return the history of risk events detected since startup as JSON."""
+            history = [
+                {"type": ev.event_type, "level": ev.level.value, "description": ev.description}
+                for ev in agent_ref._event_history[-50:]
+            ]
+            return json.dumps({"event_history": history, "total_events": len(agent_ref._event_history)})
+
+        return [check_risk_status, get_risk_event_history]

@@ -3,7 +3,7 @@ LMP price forecasting model: training, evaluation, and inference.
 
 Two models are trained and kept:
     da_model — XGBoost forecasting day-ahead LMP (24 h horizon, hourly)
-    rt_model — LightGBM forecasting real-time LMP (1 h horizon, 5-min)
+    rt_model — LightGBM forecasting real-time LMP (1 h horizon, hourly)
 
 Model artifacts are persisted as joblib files so they can be loaded without
 retraining on each paper-trading run.
@@ -19,9 +19,9 @@ from typing import Literal
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-
-# Default artifact directory
+# Default artifact directory (relative to project root)
 _MODEL_DIR = Path("models/artifacts")
 
 ModelType = Literal["da", "rt"]
@@ -44,14 +44,34 @@ class PriceModel:
         Args:
             model_type: 'da' for XGBoost day-ahead model, 'rt' for LightGBM RT model.
         """
-        raise NotImplementedError(
-            # Set self.model_type = model_type.
-            # Initialize self._model = None (populated by train() or load()).
-            # XGBoost for 'da': xgb.XGBRegressor(n_estimators=500, learning_rate=0.05,
-            #   max_depth=6, subsample=0.8, colsample_bytree=0.8, tree_method='hist').
-            # LightGBM for 'rt': lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05,
-            #   num_leaves=31, subsample=0.8).
-        )
+        self.model_type = model_type
+        self._model = None
+        # DA prices are heavily right-skewed (scarcity spikes) with occasional
+        # negatives; fitting in log space sharply reduces spike leverage on RMSE.
+        # The offset keeps log1p(price + offset) positive (CAISO floor ≈ -$150).
+        self._use_log = model_type == "da"
+        self._log_offset: float = 150.0
+
+        if model_type == "da":
+            import xgboost as xgb
+            self._model = xgb.XGBRegressor(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                tree_method="hist",
+                verbosity=0,
+            )
+        else:
+            import lightgbm as lgb
+            self._model = lgb.LGBMRegressor(
+                n_estimators=300,
+                learning_rate=0.05,
+                num_leaves=31,
+                subsample=0.8,
+                verbose=-1,
+            )
 
     def train(
         self,
@@ -71,10 +91,55 @@ class PriceModel:
         Returns:
             Dict with 'train_rmse' and optionally 'val_rmse'.
         """
-        raise NotImplementedError(
-            # self._model.fit(X_train, y_train, eval_set=[(X_val, y_val)], ...)
-            # Compute and return RMSE on train (and val if provided).
-        )
+        # Choose an offset that keeps log1p(price + offset) defined for the
+        # training data, with a floor that covers CAISO's ~-$150 price floor.
+        if self._use_log:
+            self._log_offset = max(150.0, float(-np.min(y_train)) + 10.0)
+
+        y_train_fit = self._fwd(y_train)
+        y_val_fit = self._fwd(y_val) if y_val is not None else None
+
+        if self.model_type == "da":
+            if X_val is not None:
+                self._model.set_params(early_stopping_rounds=50)
+                self._model.fit(
+                    X_train, y_train_fit,
+                    eval_set=[(X_val, y_val_fit)],
+                    verbose=False,
+                )
+            else:
+                self._model.fit(X_train, y_train_fit)
+        else:
+            import lightgbm as lgb
+            fit_kwargs: dict = {}
+            if X_val is not None:
+                fit_kwargs["eval_set"] = [(X_val, y_val_fit)]
+                fit_kwargs["callbacks"] = [
+                    lgb.early_stopping(stopping_rounds=50, verbose=False),
+                    lgb.log_evaluation(period=-1),
+                ]
+            self._model.fit(X_train, y_train_fit, **fit_kwargs)
+
+        # Metrics are reported in real price space (after inverse transform).
+        metrics: dict[str, float] = {
+            "train_rmse": float(np.sqrt(mean_squared_error(y_train, self.predict(X_train))))
+        }
+        if X_val is not None and y_val is not None:
+            metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, self.predict(X_val))))
+
+        return metrics
+
+    def _fwd(self, y: pd.Series | None) -> pd.Series | None:
+        """Forward target transform (identity unless log-space is enabled)."""
+        if y is None or not self._use_log:
+            return y
+        return np.log1p(y + self._log_offset)
+
+    def _inv(self, y: np.ndarray) -> np.ndarray:
+        """Inverse target transform back to $/MWh."""
+        if not self._use_log:
+            return y
+        return np.expm1(y) - self._log_offset
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Generate LMP forecasts for the given feature matrix.
@@ -85,10 +150,18 @@ class PriceModel:
         Returns:
             1D array of predicted LMP values in $/MWh.
         """
-        raise NotImplementedError(
-            # Validate columns match training schema.
-            # return self._model.predict(X)
-        )
+        if self._model is None:
+            raise RuntimeError("Model not trained. Call train() or load() first.")
+
+        # Align columns to training schema, filling missing with 0
+        if hasattr(self._model, "feature_names_in_"):
+            expected = list(self._model.feature_names_in_)
+            X = X.copy()
+            for col in set(expected) - set(X.columns):
+                X[col] = 0.0
+            X = X[expected]
+
+        return self._inv(self._model.predict(X))
 
     def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
         """Compute evaluation metrics on held-out test data.
@@ -100,12 +173,12 @@ class PriceModel:
         Returns:
             Dict with 'rmse', 'mae', 'r2' metrics.
         """
-        raise NotImplementedError(
-            # preds = self.predict(X_test)
-            # rmse = np.sqrt(mean_squared_error(y_test, preds))
-            # mae = mean_absolute_error(y_test, preds)
-            # r2 = r2_score(y_test, preds)
-        )
+        preds = self.predict(X_test)
+        return {
+            "rmse": float(np.sqrt(mean_squared_error(y_test, preds))),
+            "mae": float(mean_absolute_error(y_test, preds)),
+            "r2": float(r2_score(y_test, preds)),
+        }
 
     def save(self, path: Path | str) -> None:
         """Persist the trained model artifact to disk.
@@ -113,8 +186,18 @@ class PriceModel:
         Args:
             path: Destination .joblib file path.
         """
-        raise NotImplementedError(
-            # joblib.dump(self._model, path)
+        if self._model is None:
+            raise RuntimeError("Cannot save: model has not been trained yet.")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "model": self._model,
+                "model_type": self.model_type,
+                "use_log": self._use_log,
+                "log_offset": self._log_offset,
+            },
+            path,
         )
 
     @classmethod
@@ -128,11 +211,13 @@ class PriceModel:
         Returns:
             PriceModel instance with self._model populated.
         """
-        raise NotImplementedError(
-            # instance = cls(model_type=model_type)
-            # instance._model = joblib.load(path)
-            # return instance
-        )
+        payload = joblib.load(path)
+        instance = cls.__new__(cls)
+        instance.model_type = payload.get("model_type", model_type)
+        instance._model = payload["model"]
+        instance._use_log = payload.get("use_log", False)
+        instance._log_offset = payload.get("log_offset", 150.0)
+        return instance
 
     def feature_importance(self, top_n: int = 20) -> pd.DataFrame:
         """Return the top-N most important features by gain.
@@ -143,10 +228,20 @@ class PriceModel:
         Returns:
             DataFrame with columns ['feature', 'importance'] sorted descending.
         """
-        raise NotImplementedError(
-            # Extract feature_importances_ from self._model.
-            # Return as sorted DataFrame.
-        )
+        if self._model is None or not hasattr(self._model, "feature_importances_"):
+            raise RuntimeError("Model not trained or does not expose feature_importances_.")
+
+        importances = self._model.feature_importances_
+        names: list[str]
+        if hasattr(self._model, "feature_names_in_"):
+            names = list(self._model.feature_names_in_)
+        elif hasattr(self._model, "feature_name_"):
+            names = list(self._model.feature_name_)
+        else:
+            names = [f"f{i}" for i in range(len(importances))]
+
+        df = pd.DataFrame({"feature": names, "importance": importances})
+        return df.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
 
 
 def train_pipeline(
@@ -170,14 +265,62 @@ def train_pipeline(
         db_path: Path to the DuckDB database.
 
     Returns:
-        Trained PriceModel instance.
+        Trained PriceModel instance (artifact also saved to _MODEL_DIR).
     """
-    raise NotImplementedError(
-        # 1. Open MarketDB, call query_features() for train and val ranges.
-        # 2. Call build_feature_matrix() for each split.
-        # 3. Instantiate PriceModel(model_type=model_type).
-        # 4. Call model.train(X_train, y_train, X_val, y_val).
-        # 5. Log eval metrics via structlog.
-        # 6. Save artifact to _MODEL_DIR / f"{model_type}_{node_short_name}.joblib".
-        # 7. Return the trained model.
+    import structlog
+
+    from src.config.nodes import node_short_name
+    from src.data.db import MarketDB
+    from src.models.features import build_feature_matrix
+
+    log = structlog.get_logger()
+
+    # Horizon: 24h for DA, 1h for RT (using same hourly DA data as proxy)
+    horizon = 24 if model_type == "da" else 1
+
+    with MarketDB(db_path) as db:
+        train_df = db.query_features(node, start_train, end_train)
+        val_df = db.query_features(node, start_val, end_val)
+
+    if train_df.empty:
+        raise ValueError(
+            f"No training data for {node} from {start_train} to {end_train}. "
+            "Run: python main.py data-fetch first."
+        )
+
+    log.info("data_loaded", node=node, n_train_rows=len(train_df), n_val_rows=len(val_df))
+
+    X_train, y_train = build_feature_matrix(
+        train_df, pd.DataFrame(), pd.DataFrame(), forecast_horizon_h=horizon
     )
+    log.info("features_built", n_train=len(X_train), n_features=X_train.shape[1])
+
+    X_val: pd.DataFrame | None = None
+    y_val: pd.Series | None = None
+    if not val_df.empty:
+        X_val, y_val = build_feature_matrix(
+            val_df, pd.DataFrame(), pd.DataFrame(), forecast_horizon_h=horizon
+        )
+        log.info("val_features_built", n_val=len(X_val))
+
+    model = PriceModel(model_type=model_type)
+    metrics = model.train(X_train, y_train, X_val, y_val)
+    log.info("model_trained", **metrics)
+
+    if X_val is not None and y_val is not None:
+        eval_metrics = model.evaluate(X_val, y_val)
+        log.info("model_evaluated", **eval_metrics)
+        target_rmse = 15.0
+        if eval_metrics["rmse"] > target_rmse:
+            log.warning(
+                "rmse_above_target",
+                rmse=eval_metrics["rmse"],
+                target=target_rmse,
+            )
+
+    short = node_short_name(node)
+    artifact_path = _MODEL_DIR / f"{model_type}_{short}.joblib"
+    model.save(artifact_path)
+    log.info("model_saved", path=str(artifact_path))
+
+    return model

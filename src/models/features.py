@@ -17,17 +17,29 @@ Feature groups:
 
 from __future__ import annotations
 
-from typing import Sequence
-
 import numpy as np
 import pandas as pd
-
 
 # Lag offsets in hours for RT LMP features
 _LMP_LAG_HOURS: list[int] = [1, 2, 3, 4, 24, 48, 168]
 
 # Rolling window sizes in hours
 _ROLLING_WINDOWS_H: list[int] = [4, 24, 168]
+
+_WEATHER_COLS: list[str] = [
+    "shortwave_radiation", "direct_radiation", "temperature_2m",
+    "wind_speed_10m", "cloud_cover",
+]
+
+try:
+    import holidays as _holidays_lib
+    _US_HOLIDAYS: set = set(_holidays_lib.US(years=range(2020, 2030)).keys())
+
+    def _is_holiday(ts: pd.Timestamp) -> int:
+        return int(ts.date() in _US_HOLIDAYS)
+except ImportError:
+    def _is_holiday(ts: pd.Timestamp) -> int:  # type: ignore[misc]
+        return 0
 
 
 def build_feature_matrix(
@@ -41,24 +53,38 @@ def build_feature_matrix(
 
     Args:
         lmp_df: Historical LMP DataFrame with columns [time, lmp, ...].
-        load_df: Load DataFrame with columns [time, load_mw, forecast_mw].
+                May already contain load and weather columns if pre-joined.
+        load_df: Load DataFrame with columns [time, load_mw]. Pass empty DF if
+                 load is already in lmp_df.
         weather_df: Weather DataFrame with columns [time, shortwave_radiation, ...].
+                    Pass empty DF if weather is already in lmp_df.
         target_col: Name of the column to use as the prediction target.
         forecast_horizon_h: Hours ahead to predict; labels are shifted by this amount.
 
     Returns:
         (X, y) where X is the feature DataFrame and y is the target Series,
-        both aligned on the same index with NaN rows dropped.
+        both aligned on the same DatetimeIndex with NaN rows dropped.
     """
-    raise NotImplementedError(
-        # 1. Merge lmp_df, load_df, weather_df on time (outer join).
-        # 2. Add temporal features via _add_temporal_features().
-        # 3. Add LMP lag features via _add_lmp_lags().
-        # 4. Add rolling statistics via _add_rolling_stats().
-        # 5. Shift target column by -forecast_horizon_h to create labels.
-        # 6. Drop rows with any NaN (caused by lags / shift at boundaries).
-        # 7. Return X (all feature cols) and y (target col).
-    )
+    df = _merge_inputs(lmp_df, load_df, weather_df)
+    df = df.sort_values("time").reset_index(drop=True)
+
+    df = _add_temporal_features(df)
+    df = _add_lmp_lags(df, lmp_col=target_col)
+    df = _add_rolling_stats(df, lmp_col=target_col)
+
+    df["_target"] = df[target_col].shift(-forecast_horizon_h)
+
+    df = df.set_index("time")
+    df.index = pd.to_datetime(df.index)
+
+    feature_cols = get_feature_names(forecast_horizon_h)
+    available_cols = [c for c in feature_cols if c in df.columns]
+
+    df_clean = df[available_cols + ["_target"]].dropna()
+    X = df_clean[available_cols]
+    y = df_clean["_target"].rename(target_col)
+
+    return X, y
 
 
 def build_inference_features(
@@ -66,7 +92,7 @@ def build_inference_features(
     load_forecast: pd.DataFrame,
     weather_forecast: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Build a single-row feature vector for live inference (no target needed).
+    """Build feature vectors for live inference (no target needed).
 
     Args:
         recent_lmp: Last ~200 hours of LMP data for lag computation.
@@ -74,31 +100,78 @@ def build_inference_features(
         weather_forecast: Forward-looking solar/weather forecast DataFrame.
 
     Returns:
-        Single-row DataFrame with all feature columns (no target column).
+        DataFrame of feature rows with the most recent fully-populated rows
+        (NaN-dropped). Each row can be passed to PriceModel.predict().
     """
-    raise NotImplementedError(
-        # Same pipeline as build_feature_matrix but without the target shift.
-        # Return only the most recent fully-populated row.
-    )
+    df = _merge_inputs(recent_lmp, load_forecast, weather_forecast)
+    df = df.sort_values("time").reset_index(drop=True)
+
+    df = _add_temporal_features(df)
+    df = _add_lmp_lags(df)
+    df = _add_rolling_stats(df)
+
+    df = df.set_index("time")
+    df.index = pd.to_datetime(df.index)
+
+    feature_cols = get_feature_names()
+    available_cols = [c for c in feature_cols if c in df.columns]
+
+    return df[available_cols].dropna()
+
+
+def _merge_inputs(
+    lmp_df: pd.DataFrame,
+    load_df: pd.DataFrame,
+    weather_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge the three input DataFrames on the 'time' column.
+
+    Skips a merge if the target columns are already present in lmp_df or the
+    source DataFrame is empty.
+    """
+    df = lmp_df.copy()
+
+    if not load_df.empty and "load_mw" not in df.columns:
+        load_cols = [c for c in ["time", "load_mw"] if c in load_df.columns]
+        df = df.merge(load_df[load_cols], on="time", how="left")
+
+    missing_weather = [c for c in _WEATHER_COLS if c not in df.columns]
+    if missing_weather and not weather_df.empty:
+        wx_cols = ["time"] + [c for c in _WEATHER_COLS if c in weather_df.columns]
+        df = df.merge(weather_df[wx_cols], on="time", how="left")
+
+    return df
 
 
 def _add_temporal_features(df: pd.DataFrame, time_col: str = "time") -> pd.DataFrame:
-    """Add hour, day-of-week, month, weekend flag, and US holiday flag.
+    """Add hour, day-of-week, month, weekend flag, holiday flag, and cyclical encodings.
 
     Args:
-        df: DataFrame with a timezone-aware datetime column.
+        df: DataFrame with a datetime column.
         time_col: Name of the datetime column.
 
     Returns:
         DataFrame with new temporal feature columns appended.
     """
-    raise NotImplementedError(
-        # df['hour'] = df[time_col].dt.hour
-        # df['dow'] = df[time_col].dt.dayofweek
-        # df['month'] = df[time_col].dt.month
-        # df['is_weekend'] = df['dow'].isin([5, 6]).astype(int)
-        # Use pandas_market_calendars or hardcoded US holidays for holiday flag.
-    )
+    df = df.copy()
+    t = pd.to_datetime(df[time_col])
+
+    df["hour"] = t.dt.hour
+    df["hour_sin"] = np.sin(2 * np.pi * t.dt.hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * t.dt.hour / 24)
+
+    df["dow"] = t.dt.dayofweek
+    df["dow_sin"] = np.sin(2 * np.pi * t.dt.dayofweek / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * t.dt.dayofweek / 7)
+
+    df["month"] = t.dt.month
+    df["month_sin"] = np.sin(2 * np.pi * t.dt.month / 12)
+    df["month_cos"] = np.cos(2 * np.pi * t.dt.month / 12)
+
+    df["is_weekend"] = t.dt.dayofweek.isin([5, 6]).astype(int)
+    df["is_holiday"] = t.apply(_is_holiday)
+
+    return df
 
 
 def _add_lmp_lags(df: pd.DataFrame, lmp_col: str = "lmp") -> pd.DataFrame:
@@ -111,10 +184,10 @@ def _add_lmp_lags(df: pd.DataFrame, lmp_col: str = "lmp") -> pd.DataFrame:
     Returns:
         DataFrame with lag columns appended: lmp_lag_1h, lmp_lag_24h, etc.
     """
-    raise NotImplementedError(
-        # for lag in _LMP_LAG_HOURS:
-        #     df[f'lmp_lag_{lag}h'] = df[lmp_col].shift(lag)
-    )
+    df = df.copy()
+    for lag in _LMP_LAG_HOURS:
+        df[f"lmp_lag_{lag}h"] = df[lmp_col].shift(lag)
+    return df
 
 
 def _add_rolling_stats(df: pd.DataFrame, lmp_col: str = "lmp") -> pd.DataFrame:
@@ -127,22 +200,35 @@ def _add_rolling_stats(df: pd.DataFrame, lmp_col: str = "lmp") -> pd.DataFrame:
     Returns:
         DataFrame with rolling stat columns appended.
     """
-    raise NotImplementedError(
-        # for w in _ROLLING_WINDOWS_H:
-        #     df[f'lmp_roll_mean_{w}h'] = df[lmp_col].rolling(w).mean()
-        #     df[f'lmp_roll_std_{w}h'] = df[lmp_col].rolling(w).std()
-    )
+    df = df.copy()
+    for w in _ROLLING_WINDOWS_H:
+        df[f"lmp_roll_mean_{w}h"] = df[lmp_col].rolling(w).mean()
+        df[f"lmp_roll_std_{w}h"] = df[lmp_col].rolling(w).std()
+    return df
 
 
 def get_feature_names(forecast_horizon_h: int = 24) -> list[str]:
     """Return the ordered list of feature column names produced by build_feature_matrix.
 
     Args:
-        forecast_horizon_h: Must match the value used during training.
+        forecast_horizon_h: Unused; kept for API consistency with callers that
+                            pass it for documentation purposes.
 
     Returns:
-        List of feature column name strings.
+        List of feature column name strings in canonical order.
     """
-    raise NotImplementedError(
-        # Return the canonical feature list so inference code can validate columns.
-    )
+    temporal = [
+        "hour", "hour_sin", "hour_cos",
+        "dow", "dow_sin", "dow_cos",
+        "month", "month_sin", "month_cos",
+        "is_weekend", "is_holiday",
+    ]
+    lags = [f"lmp_lag_{h}h" for h in _LMP_LAG_HOURS]
+    rolling = [
+        f"lmp_roll_{stat}_{w}h"
+        for w in _ROLLING_WINDOWS_H
+        for stat in ["mean", "std"]
+    ]
+    load = ["load_mw"]
+    weather = list(_WEATHER_COLS)
+    return temporal + lags + rolling + load + weather

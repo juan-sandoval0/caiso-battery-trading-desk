@@ -16,7 +16,7 @@ A multi-agent AI platform that autonomously operates a simulated battery energy 
          │ reads / writes SharedMarketState (dataclass)
 ┌────────┴──────────────────────────────────────────────────────────┐
 │  PriceForecaster  │  DispatchOptimizer  │  RiskMonitor  │  MktIntel │
-│  XGBoost/LGBM     │  Pyomo + HiGHS      │  rule-based   │  Claude   │
+│  XGBoost/LGBM     │  Pyomo + HiGHS      │  rule-based   │ Claude/OR │
 │  DA + RT LMP      │  SoC-constrained    │  spike/curtail│  notices  │
 └────────┬──────────────────────────────────────────────────────────┘
          │ reads
@@ -90,7 +90,7 @@ CS_153/
 | Package | Version | Purpose |
 |---------|---------|---------|
 | gridstatus | 0.36.0 | CAISO data (LMP, load, storage SOC, curtailment) |
-| anthropic | ≥0.40 | Claude API (market intel agent) |
+| anthropic | ≥0.40 | Claude SDK — market intel agent (routed via OpenRouter, see below) |
 | langchain | ≥0.3 | Agent tool-calling primitives |
 | langgraph | ≥0.2 | Supervisor orchestration graph |
 | pyomo | ≥6.7 | Battery dispatch MILP model |
@@ -103,6 +103,21 @@ CS_153/
 | structlog | ≥24 | Structured logging |
 | pytest | ≥8 | Testing |
 | pytest-asyncio | ≥0.23 | Async test support |
+
+## LLM Provider (MarketIntelAgent)
+
+The `MarketIntelAgent` talks to Claude through **OpenRouter**, not the Anthropic
+API directly. OpenRouter exposes an Anthropic-compatible Messages API, so the
+existing `anthropic` SDK is reused unchanged except for the client `base_url`.
+
+- **Env var**: `OPENROUTER_API_KEY` (`sk-or-v1-...`) in `.env` — required for
+  `paper-trade` and the live orchestrator graph.
+- **Base URL**: `https://openrouter.ai/api` (the SDK appends `/v1/messages`; do
+  **not** include the trailing `/v1`). Override via `OPENROUTER_BASE_URL` if proxying.
+- **Model**: `anthropic/claude-sonnet-4.6` — the OpenRouter slug for the same
+  Anthropic model (`claude-sonnet-4-6`).
+- Config lives in `src/config/settings.py` (`openrouter_api_key`,
+  `openrouter_base_url`); the agent accepts an optional `base_url` arg.
 
 ## CAISO Data Details
 
@@ -147,7 +162,9 @@ streamlit run src/dashboard/app.py
 
 ## Current Status
 
-- [ ] Phase 1: Data pipeline
-- [ ] Phase 2: Core agents (Forecaster + Optimizer)
-- [ ] Phase 3: Supporting agents + Orchestrator
-- [ ] Phase 4: Dashboard + paper-trading + final report
+- [x] Phase 1: Data pipeline (NP15/SP15/ZP26, 2023-07–2024-12 in DuckDB)
+- [x] Phase 2: Core agents (Forecaster RMSE $15.61 full-H2 OOS; Optimizer LP < 0.02 s)
+- [x] Phase 3: Supporting agents + Orchestrator (LangGraph tick verified end-to-end)
+- [x] Phase 4: Dashboard + benchmarking notebooks + final report
+- Tests: 82 passing (`pytest tests/ -m "not integration"`); 2 live-CAISO integration tests gated on `RUN_INTEGRATION=1`
+- Backtest (2024 H2 OOS): net +$1,054 vs naive −$65,744; Sharpe 1.49; SoC bounds respected on all 176 days

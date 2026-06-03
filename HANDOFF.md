@@ -1,15 +1,26 @@
 # Handoff — CAISO Battery Storage Trading Desk
 
-**Date:** 2026-05-17  
-**Repo:** https://github.com/juan-sandoval0/caiso-battery-trading-desk  
-**Phase complete:** Phase 1 (Data Pipeline)  
-**Phase next:** Phase 2 (Price Forecaster + Dispatch Optimizer)
+**Date:** 2026-05-31 (revised; prior revisions 2026-05-30, 2026-05-17)
+**Repo:** https://github.com/juan-sandoval0/caiso-battery-trading-desk
+**Code state:** **All four phases complete**, committed on branch `finish-project` (9 commits ahead of `origin/main`, not yet pushed).
+**Remaining:** push `finish-project` and open a PR (optional); optionally wire `ANTHROPIC_API_KEY` for a live MarketIntel paper-trade run.
+
+> **History:** The 2026-05-17 handoff described everything past Phase 1 as
+> `NotImplementedError` stubs; that was stale (code was written but uncommitted).
+> A 2026-05-30 revision corrected that but predated the train/backtest/dashboard/
+> notebook/report work. This revision reflects the finished project.
+
+## TL;DR results (2024 H2 out-of-sample, NP15)
+- DA forecaster RMSE **$15.61/MWh** full-H2 (MAE $6.42; $6.42 Oct–Dec). Summer spikes inflate it; non-spike RMSE $9.93.
+- Backtest: net **+$1,054** vs naive **−$65,744**; Sharpe **1.49**; all 176 days solve optimal in ~0.012 s; SoC stays in [10%, 90%].
+- Tests: **82 pass** (`pytest tests/ -m "not integration"`); 2 live-CAISO integration tests gated on `RUN_INTEGRATION=1`.
+- Artifacts (gitignored): `models/artifacts/{da,rt}_NP15.joblib`, `results/backtest_2024H2.csv`.
 
 ---
 
 ## What exists right now
 
-### Fully implemented and tested
+### Fully implemented (config + data layer, Phase 1)
 | File | What it does |
 |------|-------------|
 | `src/config/settings.py` | Pydantic settings loaded from `.env`; `get_settings()` is a cached singleton |
@@ -18,64 +29,54 @@
 | `src/data/db.py` | DuckDB wrapper with 8-table schema; `INSERT OR REPLACE` upserts; `query_lmp()`, `query_features()`, `get_latest_data_date()` |
 | `src/data/caiso_fetcher.py` | Fetches LMP (DA + RT 5-min), load, fuel mix, storage SOC, curtailment via gridstatus; 30-day chunks, 3-retry backoff |
 | `src/data/weather_fetcher.py` | Open-Meteo ERA5 historical + 7-day forecast; hourly solar irradiance, temperature, wind |
-| `main.py` | `data-fetch` CLI with `--incremental`, `--skip-storage`, `--skip-weather` flags |
+| `main.py` | All four CLI commands wired: `data-fetch`, `train`, `backtest`, `paper-trade` |
 
-### Stub files (signatures + docstrings, no implementation)
-All files in `src/agents/`, `src/orchestrator/`, `src/models/`, `src/optimization/`, `src/dashboard/`, and all `tests/` files exist with full type-hinted signatures and implementation comments. Nothing raises silently — everything is `raise NotImplementedError(...)`.
+### Implemented and validated against real data (Phases 2–4)
+| Area | Files | Status |
+|------|-------|--------|
+| Forecasting | `src/models/features.py`, `src/models/price_model.py` | Trained on NP15; DA model fits in **log1p price space** (offset +150) |
+| Optimization | `src/optimization/battery_dispatch.py` | Pyomo LP + naive/perfect baselines; ~0.012 s/solve |
+| Agents | `src/agents/{forecaster,optimizer,risk_monitor,market_intel}.py` | Full impl |
+| Orchestrator | `src/orchestrator/{shared_state,conflict_resolver,coordinator}.py` | LangGraph tick verified end-to-end |
+| Dashboard | `src/dashboard/app.py` | Live + backtest pages; verified serving (health 200) |
+| Notebooks/report | `notebooks/01_eda.ipynb`, `notebooks/02_benchmarking.ipynb`, `report/final_report.md` | Executed with embedded figures; report filled with real numbers |
+
+### Data in DuckDB (`data/market.duckdb`, gitignored)
+DA LMP (2023-02→2026-04, all 3 hubs), RT 5-min LMP / load / fuel mix / weather (2023-07→2024-12).
+**curtailment and storage_soc are empty** — curtailment crashes inside gridstatus
+(`ValueError: No objects to concatenate`); neither is used by `query_features` or any
+downstream code, so this does not affect training/backtest.
 
 ---
 
-## How to run what works today
+## How to reproduce end-to-end
 
 ```bash
-# Install deps
 pip install -r requirements.txt
-
-# Fetch historical data (run once; ~30-45 min for 3 years)
-python main.py data-fetch --start 2023-02-01 --end 2026-04-30 --skip-storage --db data/market.duckdb
-
-# Fetch incrementally after first run
-python main.py data-fetch --start 2023-02-01 --end 2026-04-30 --skip-storage --db data/market.duckdb --incremental
+python main.py data-fetch --start 2023-07-01 --end 2024-12-31 --skip-storage   # ~25 min; curtailment step errors harmlessly
+# weather is fetched inside data-fetch AFTER curtailment, so it may need a direct top-up:
+#   python -c "from datetime import date; from src.data.db import MarketDB; from src.data.weather_fetcher import WeatherFetcher; from src.config.nodes import CAISO_HUB_NODES; \
+#     db=MarketDB('data/market.duckdb'); wx=WeatherFetcher(); db.upsert_weather(wx.get_solar_history_all_nodes(CAISO_HUB_NODES, date(2023,7,1), date(2024,12,31)))"
+python main.py train --node TH_NP15_GEN-APND --model-type da \
+  --train-start 2023-07-01 --train-end 2024-06-30 --val-start 2024-07-01 --val-end 2024-09-30
+python main.py train --node TH_NP15_GEN-APND --model-type rt \
+  --train-start 2023-07-01 --train-end 2024-06-30 --val-start 2024-07-01 --val-end 2024-09-30
+python main.py backtest --node TH_NP15_GEN-APND --start 2024-07-01 --end 2024-12-31 --output results/backtest_2024H2.csv
+cd notebooks && jupyter nbconvert --to notebook --execute --inplace 01_eda.ipynb 02_benchmarking.ipynb && cd ..
+pytest tests/ -v --timeout=60 -m "not integration"
+streamlit run src/dashboard/app.py
 ```
 
 ---
 
-## Phase 2 — what to build next
+## Gotchas discovered this session (don't re-trip them)
 
-### 1. `src/models/features.py`
-Build the feature matrix from DuckDB. Key features:
-- LMP lags: `t-1h, t-2h, t-24h, t-48h, t-168h`
-- Rolling stats: 4h, 24h, 168h mean and std
-- Temporal: hour, day-of-week, month, is_weekend
-- Solar: `shortwave_radiation`, `cloud_cover` from weather table
-- Load: `load_mw` from load_actual table
-- Entry point: `build_feature_matrix(lmp_df, load_df, weather_df)` → `(X, y)`
-
-### 2. `src/models/price_model.py`
-- `PriceModel(model_type='da')` wraps XGBoost; `model_type='rt'` wraps LightGBM
-- `train(X_train, y_train, X_val, y_val)` → returns RMSE dict
-- `save()` / `load()` use `joblib` to `models/artifacts/`
-- `train_pipeline(node, start_train, end_train, ...)` ties DB → features → train → save
-- Target RMSE: ≤ $15/MWh out-of-sample on NP15
-
-### 3. `src/optimization/battery_dispatch.py`
-- `BatteryDispatchOptimizer.solve(prices_mwh, interval_hours, initial_soc_mwh, constraints)`
-- Pyomo `ConcreteModel` LP — no binary variables needed
-- Solver: `appsi_highs` (install: `pip install highspy`); fallback `glpk`
-- Also implement `solve_baseline_naive()` and `solve_perfect_hindsight()` for benchmarking
-- `DispatchResult.to_dataframe(times)` for dashboard consumption
-
-### 4. `main.py train` and `main.py backtest` commands
-- `train`: calls `train_pipeline()`, prints val RMSE, saves artifact
-- `backtest`: loads model + DB, iterates days, calls optimizer, writes P&L CSV
-
-### Acceptance criteria for Phase 2
-- [ ] DA forecaster RMSE ≤ $15/MWh on 2024 out-of-sample (NP15)
-- [ ] LP solves to optimality in < 2s for a 24h horizon
-- [ ] Backtest on 2024 shows positive P&L vs. naive valley-fill strategy
-- [ ] SoC bounds (10%–90%) never violated in any solved schedule
-
----
+1. **`query_features` load join (fixed):** hourly DA LMP was joined to 5-min `load_actual` on the hour, fanning each hour into ~12 duplicate rows and silently corrupting all lag/rolling features. Now aggregates load to hourly. If you add another sub-hourly table to the join, aggregate it first.
+2. **DA RMSE needs the log transform:** without `log1p` the full-H2 RMSE is ~$19.8; with it, $15.61. Summer heat-wave spikes (2.2% of hours, LMP→$583) are the only thing keeping it above $15 — they are not forecastable 24 h ahead from price history.
+3. **Degradation cost is steep:** $0.05/kWh is charged on **both** charge and discharge legs (~$100/MWh round-trip), so the optimizer only trades on large spreads → thin profit (8/176 profitable days, 11.9% of perfect-hindsight). Tune `degradation_cost_per_kwh` in `src/config/battery.py` if you want more aggressive cycling.
+4. **`data/` gitignore was unanchored** — it had hidden the entire `src/data/` package from git. Now anchored to `/data/`. Keep it anchored.
+5. **`pytest-timeout` is required** by the documented `--timeout` test command; it's in `requirements.txt`.
+6. **`paper-trade` needs `ANTHROPIC_API_KEY`** (MarketIntel/Claude) and current-dated CAISO data; it was validated only as a mocked single-tick graph test (`tests/test_orchestrator/test_coordinator_graph.py`), not a sustained live run.
 
 ## Key facts to remember
 
