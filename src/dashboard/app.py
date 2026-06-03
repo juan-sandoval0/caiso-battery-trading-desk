@@ -40,7 +40,7 @@ from src.config.nodes import CAISO_HUB_NODES, DEFAULT_HUB_NODE
 _DEFAULT_DB_PATH: Path = Path("data/market.duckdb")
 
 # Default backtest results CSV produced by `python main.py backtest`
-_DEFAULT_BACKTEST_CSV: Path = Path("results/backtest.csv")
+_DEFAULT_BACKTEST_CSV: Path = Path("results/backtest_2024H2.csv")
 
 # Auto-refresh interval in seconds (matches CAISO 5-min RT dispatch)
 _REFRESH_INTERVAL_S: int = 300
