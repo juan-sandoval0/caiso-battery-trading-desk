@@ -178,3 +178,26 @@ RUN_INTEGRATION=1 pytest tests/ -v --timeout=120
 ```
 
 82 unit tests pass; 2 integration tests are gated on `RUN_INTEGRATION=1`.
+
+## External Resources
+
+- [CAISO OASIS](http://oasis.caiso.com/) — official source for LMP, load, and curtailment data
+- [gridstatus](https://github.com/kmax12/gridstatus) — Python library used to query CAISO OASIS
+- [Open-Meteo](https://open-meteo.com/) — free weather/solar forecast API (no key required)
+- [OpenRouter](https://openrouter.ai/) — unified LLM API gateway used to route Claude calls
+- [LangGraph](https://github.com/langchain-ai/langgraph) — multi-agent graph orchestration framework
+- [Pyomo](http://www.pyomo.org/) — Python optimization modeling language for the dispatch LP
+- [HiGHS](https://highs.dev/) — open-source LP/MILP solver backing the Pyomo model
+- [DuckDB](https://duckdb.org/) — embedded columnar database for local market data storage
+- [Streamlit](https://streamlit.io/) — framework for the live P&L dashboard
+
+## Acknowledgements
+
+- CAISO public market data made available via [CAISO OASIS](http://oasis.caiso.com/) under open-access tariff
+- Weather data from [Open-Meteo](https://open-meteo.com/) ERA5 reanalysis (CC BY 4.0)
+- [gridstatus](https://github.com/kmax12/gridstatus) by @kmax12 and contributors for abstracting the CAISO API
+- Stanford CS 153 course staff for project guidance and feedback
+
+## AI Disclosure
+
+This project was developed using [Claude Code](https://claude.ai/code) as a coding assistant.
